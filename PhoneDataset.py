@@ -4,141 +4,95 @@ from typing import List, Tuple, Optional
 import torch
 from torch.utils.data import Dataset
 import math
-from arpabetIpaConverter import ARPAbetIPAConverter
+
+STANDARD_IPA = [
+    # Vowels
+    'ɑ', 'æ', 'ʌ', 'ɔ', 'aʊ', 'aɪ', 'ɛ', 'ɝ', 'eɪ', 'ɪ', 'i', 'oʊ', 'ɔɪ', 'ʊ', 'u',
+    # Consonants
+    'b', 'tʃ', 'd', 'ð', 'f', 'ɡ', 'h', 'dʒ', 'k', 'l', 'm', 'n', 'ŋ', 'p', 'ɹ', 's', 'ʃ', 't', 'θ', 'v', 'w', 'j', 'z', 'ʒ',
+    # Other
+    'ʔ', 'ɾ', 'x',
+    # Stress markers
+    'ˈ', 'ˌ',
+]
 
 class PhoneDataset(Dataset):
 
-    ipa_converter = ARPAbetIPAConverter()
-
-    def __init__(self, data_path: str, freq_path: Optional[str] = None, max_words: int = 20000, 
-                 max_len: int = 32):
+    def __init__(self, data_path: str, max_words: int = 200000, max_len: int = 48):
         self.max_len = max_len
         self.data = []
         self.char_to_idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
         self.phone_to_idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
         self.idx_to_char = {0: '<pad>', 1: '<sos>', 2: '<eos>', 3: '<unk>'}
         self.idx_to_phone = {0: '<pad>', 1: '<sos>', 2: '<eos>', 3: '<unk>'}
+        
+        for phone in STANDARD_IPA:
+            if phone not in self.phone_to_idx:
+                idx = len(self.phone_to_idx)
+                self.phone_to_idx[phone] = idx
+                self.idx_to_phone[idx] = phone
+
         self.direction = 'g2p'
-        self.word_weights = {}
         
-        # Load frequency data if provided
-        word_frequencies = {}
-        if freq_path:
-            word_frequencies = self._load_frequencies(freq_path, max_words)
+        # Parse data file
+        raw_data = self._parse_data(data_path)
         
-        # Parse CMU dictionary
-        raw_data = self._parse_cmu_dict(data_path)
+        # Limit number of words, shuffling first to get a diverse sample
+        if len(raw_data) > max_words:
+            random.shuffle(raw_data)
+            raw_data = raw_data[:max_words]
         
-        # Filter and sort by frequency if frequencies are available
-        if word_frequencies:
-            raw_data = self._filter_by_frequency(raw_data, word_frequencies, max_words)
-        else:
-            raw_data = raw_data[:max_words]  # Just take first max_words if no frequencies
-        
-        # Build vocabularies
+        # Build vocabularies from the loaded data
         self._build_vocabularies(raw_data)
         
-        # Convert to indices
+        # Convert text and phonemes to numerical indices
         self.data = self._convert_to_indices(raw_data)
         
-        print(f"Loaded {len(self.data)} word-pronunciation pairs")
+        print(f"Loaded {len(self.data)} word-pronunciation pairs.")
         print(f"Character vocab size: {len(self.char_to_idx)}")
         print(f"Phone vocab size: {len(self.phone_to_idx)}")
     
-    def _load_frequencies(self, freq_path: str, max_words: int) -> dict:
-        """Load word frequencies from CSV file"""
-        word_frequencies = {}
-        try:
-            freq_df = pd.read_csv(freq_path)
-            count = 0
-            for _, row in freq_df.iterrows():
-                if count >= max_words:
-                    break
-                
-                word = str(row['word']).upper() if pd.notna(row['word']) else "NULL"
-                frequency = int(row['count']) if pd.notna(row['count']) else 1
-                word_frequencies[word] = frequency
-                count += 1
-                
-        except Exception as e:
-            print(f"Warning: Could not load frequency file {freq_path}: {e}")
-            
-        return word_frequencies
-    
-    def _filter_by_frequency(self, raw_data: List[Tuple[str, List[str]]], 
-                           word_frequencies: dict, max_words: int) -> List[Tuple[str, List[str]]]:
-        """Filter and sort data by word frequency"""
-        # Add frequency information and filter
-        freq_filtered = []
-        for word, phones in raw_data:
-            if word in word_frequencies:
-                freq_filtered.append((word, phones, word_frequencies[word]))
-        
-        # Sort by frequency (highest first)
-        freq_filtered.sort(key=lambda x: x[2], reverse=True)
-        
-        # Create word weights for sampling
-        for word, _, freq in freq_filtered[:max_words]:
-            self.word_weights[word] = self._calculate_weight(freq)
-        
-        # # Print every 5000 with there chance of being sampled
-        # for i, (word, _, freq) in enumerate(freq_filtered[:max_words]):
-        #     if i % 5000 == 0:
-        #         print(f"Word: {word}, Frequency: {freq}, Weight: {self.word_weights[word]}")
-
-        # Return just word-phone pairs
-        return [(w, p) for w, p, _ in freq_filtered[:max_words]]
-    
-    def _calculate_weight(self, freq: int) -> float:
-        """Calculate sampling weight from frequency"""
-        return max(1.0, math.sqrt(freq) ** 0.6 * math.atan((freq + 1) / 1000000))
-    
-    def _parse_cmu_dict(self, data_path: str) -> List[Tuple[str, List[str]]]:
-        """Parse CMU pronunciation dictionary"""
+    def _parse_data(self, data_path: str) -> List[Tuple[str, List[str]]]:
+        """Parse IPA pronunciation dictionary (format: word\t/ipa/)"""
         data = []
-        with open(data_path, 'r', encoding='latin-1') as f:
+        # Sort known phonemes by length (desc) for greedy tokenization
+        known_phonemes = sorted([p for p in self.phone_to_idx if len(p) > 1], key=len, reverse=True)
+
+        with open(data_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                # Skip comments and empty lines
-                if not line or line.startswith(';;;'):
+                if '\t' not in line:
                     continue
                 
-                # Split on first space(s)
-                parts = line.split(None, 1)
-                if len(parts) != 2:
+                word, pronunciations = line.split('\t', 1)
+                word = word.strip().upper()
+
+                if not any(c.isalpha() for c in word):
                     continue
-                
-                word, phones_str = parts
-                
-                if '(' in word:
-                    continue
-                    word = word[:word.index('(')].strip()
-                    if len(word) == 0:
-                        continue
-                    
-                # Skip words that don't start with A-Z
-                if not word[0].isalpha():
-                    continue
-                
-                # Clean up phones - separate stress markers
+
+                # Take the first pronunciation and clean it
+                pron = pronunciations.split(',')[0].strip().replace('/', '')
+
+                # Tokenize IPA string into a list of phonemes
                 phones = []
-                for phone in phones_str.split():
-                    if phone[-1].isdigit():
-                        phones.append(phone[:-1]) # Phone without stress
-                    else:
-                        phones.append(phone)
-
-                phones = [self.ipa_converter.convert_character_from_arpabet(phone) for phone in phones]
-
-                if word == 'HELLO':
-                    print(f"Converted 'hello' phones: {phones}")
+                i = 0
+                while i < len(pron):
+                    # Greedily match longest known multi-character phoneme first
+                    match = next((p for p in known_phonemes if pron.startswith(p, i)), None)
                     
-                data.append((word.upper(), phones))
-        
+                    if match:
+                        phones.append(match)
+                        i += len(match)
+                    else:
+                        # Otherwise, take a single character
+                        phones.append(pron[i])
+                        i += 1
+                
+                data.append((word, phones))
         return data
-    
+
     def _build_vocabularies(self, data: List[Tuple[str, List[str]]]):
-        """Build character and phone vocabularies"""
+        """Build character and phone vocabularies from the data"""
         chars = set()
         phones = set()
         
@@ -147,35 +101,30 @@ class PhoneDataset(Dataset):
             phones.update(phone_seq)
         
         # Add characters to vocab
-        for char in sorted(chars):
+        for char in sorted(list(chars)):
             if char not in self.char_to_idx:
                 idx = len(self.char_to_idx)
                 self.char_to_idx[char] = idx
                 self.idx_to_char[idx] = char
         
         # Add phones to vocab
-        for phone in sorted(phones):
+        for phone in sorted(list(phones)):
             if phone not in self.phone_to_idx:
                 idx = len(self.phone_to_idx)
                 self.phone_to_idx[phone] = idx
                 self.idx_to_phone[idx] = phone
     
     def _convert_to_indices(self, data: List[Tuple[str, List[str]]]) -> List[Tuple[List[int], List[int]]]:
-        """Convert words and phones to index sequences"""
+        """Convert words and phones to padded index sequences"""
         converted = []
         
         for word, phones in data:
-            # Convert word to character indices
-            char_indices = [self.char_to_idx.get(c.lower(), self.char_to_idx['<unk>']) 
-                           for c in word]
+            char_indices = [self.char_to_idx.get(c.lower(), self.char_to_idx['<unk>']) for c in word]
             char_indices = [self.char_to_idx['<sos>']] + char_indices + [self.char_to_idx['<eos>']]
             
-            # Convert phones to indices
-            phone_indices = [self.phone_to_idx.get(p, self.phone_to_idx['<unk>']) 
-                            for p in phones]
+            phone_indices = [self.phone_to_idx.get(p, self.phone_to_idx['<unk>']) for p in phones]
             phone_indices = [self.phone_to_idx['<sos>']] + phone_indices + [self.phone_to_idx['<eos>']]
             
-            # Pad sequences
             char_indices = self._pad_sequence(char_indices, self.max_len, self.char_to_idx['<pad>'])
             phone_indices = self._pad_sequence(phone_indices, self.max_len, self.phone_to_idx['<pad>'])
             
@@ -184,34 +133,10 @@ class PhoneDataset(Dataset):
         return converted
     
     def _pad_sequence(self, seq: List[int], max_len: int, pad_token: int) -> List[int]:
-        """Pad sequence to max_len"""
+        """Pad or truncate sequence to max_len"""
         if len(seq) > max_len:
-            return seq[:max_len]
+            return seq[:max_len-1] + [seq[-1]] # Ensure <eos> is kept
         return seq + [pad_token] * (max_len - len(seq))
-    
-    def indices_to_word(self, indices: List[int]) -> str:
-        """Convert character indices back to word"""
-        chars = []
-        for idx in indices:
-            if idx in [0, 1, 2]:  # Skip pad, sos, eos
-                continue
-            if idx == 3:  # unk token
-                chars.append('?')
-            else:
-                chars.append(self.idx_to_char.get(idx, '?'))
-        return ''.join(chars).upper()
-    
-    def indices_to_phones(self, indices: List[int]) -> List[str]:
-        """Convert phone indices back to phone sequence"""
-        phones = []
-        for idx in indices:
-            if idx in [0, 1, 2]:  # Skip pad, sos, eos
-                continue
-            if idx == 3:  # unk token
-                phones.append('<?>')
-            else:
-                phones.append(self.idx_to_phone.get(idx, '<?>'))
-        return phones
     
     def random_split(self, train_size: float = 0.8) -> Tuple['PhoneDataset', 'PhoneDataset']:
         """Randomly split dataset into training and validation sets"""
@@ -222,36 +147,23 @@ class PhoneDataset(Dataset):
         train_indices = indices[:split_idx]
         val_indices = indices[split_idx:]
         
-        # Create new dataset instances
         train_dataset = self._create_split_dataset([self.data[i] for i in train_indices])
         val_dataset = self._create_split_dataset([self.data[i] for i in val_indices])
         
         return train_dataset, val_dataset
     
     def _create_split_dataset(self, data_subset: List[Tuple[List[int], List[int]]]) -> 'PhoneDataset':
-        """Create a new dataset instance with a subset of data"""
+        """Helper to create a new dataset instance with a subset of data"""
         new_dataset = PhoneDataset.__new__(PhoneDataset)
         new_dataset.data = data_subset
         new_dataset.max_len = self.max_len
         
-        # Copy vocabularies
+        # Copy vocabularies and settings
         new_dataset.char_to_idx = self.char_to_idx.copy()
         new_dataset.phone_to_idx = self.phone_to_idx.copy()
         new_dataset.idx_to_char = self.idx_to_char.copy()
         new_dataset.idx_to_phone = self.idx_to_phone.copy()
-        
         new_dataset.direction = self.direction
-        
-        # Copy relevant word weights
-        new_dataset.word_weights = {}
-        for char_seq, phone_seq in data_subset:
-            if self.direction == 'g2p':
-                word = self.indices_to_word(char_seq)
-            else:
-                word = self.indices_to_word(phone_seq)
-            
-            if word in self.word_weights:
-                new_dataset.word_weights[word] = self.word_weights[word]
         
         return new_dataset
 
@@ -266,52 +178,7 @@ class PhoneDataset(Dataset):
             return torch.tensor(phone_seq, dtype=torch.long), torch.tensor(char_seq, dtype=torch.long)
     
     def set_direction(self, direction: str):
-        """Set the direction for the dataset (g2p or p2g)"""
+        """Set the dataset's direction ('g2p' or 'p2g')"""
         if direction not in ['g2p', 'p2g']:
             raise ValueError("Direction must be 'g2p' or 'p2g'")
         self.direction = direction
-
-    def __str__(self):
-        return f"PhoneDataset(direction={self.direction}, size={len(self.data)}, " \
-               f"char_vocab_size={len(self.char_to_idx)}, phone_vocab_size={len(self.phone_to_idx)})" \
-               f"\nWord weights: {len(self.word_weights)} unique words" \
-               f"\nSample data: {self.data[:3]}"
-
-class WeightedSampler:
-    """Custom sampler that weights samples by word frequency"""
-    def __init__(self, dataset: PhoneDataset, replacement: bool = True):
-        self.dataset = dataset
-        self.replacement = replacement
-        self.weights = self._calculate_weights()
-    
-    def _calculate_weights(self) -> torch.Tensor:
-        """Calculate sampling weights for each sample"""
-        weights = []
-        
-        for char_seq, phone_seq in self.dataset.data:
-            # Get the word based on current direction
-            if self.dataset.direction == 'g2p':
-                word = self.dataset.indices_to_word(char_seq)
-            else:  # p2g
-                word = self.dataset.indices_to_word(phone_seq)
-            
-            # Get weight for this word
-            weight = self.dataset.word_weights.get(word, 1.0)
-            weights.append(weight)
-        
-        return torch.tensor(weights, dtype=torch.float)
-    
-    def __iter__(self):
-        if self.replacement:
-            # Sample with replacement
-            for _ in range(len(self.dataset)):
-                yield torch.multinomial(self.weights, 1).item()
-        else:
-            # Sample without replacement
-            if len(self.weights) > 0:
-                indices = torch.multinomial(self.weights, len(self.dataset), replacement=False)
-                for idx in indices:
-                    yield idx.item()
-    
-    def __len__(self):
-        return len(self.dataset)

@@ -1,304 +1,214 @@
-"""
-Interactive testing script for both G2P and P2G models with IPA support
-"""
-import torch
 import sys
+from pathlib import Path
+from typing import Dict, List
+import torch
+import os
 import re
-from transformer import G2PTransformer, P2GTransformer, train_model, inference
-from PhoneDataset import PhoneDataset as Dataset
-from arpabetIpaConverter import ARPAbetIPAConverter
 
-class ModelTester:
-    def __init__(self, data_path='cmudict.dict', freq_path='word_frequencies.csv'):
+from PhoneDataset import PhoneDataset
+from transformer import G2PTransformer, P2GTransformer, inference
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+MODEL_DIR = Path("models")
+DATA_DIR = Path("data")
+MAX_LEN = 48  # Must match training configuration
+MAX_WORDS = 200000 # Must match training configuration
+
+# ---------------------------------------------------------------------------
+# Language Builders
+# ---------------------------------------------------------------------------
+
+def prepare_dataset(language: str, direction: str):
+    """Loads the dataset needed for model inference."""
+    data_path = DATA_DIR / f"{language}.txt"
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found for language '{language}' at {data_path}")
+    
+    ds = PhoneDataset(data_path=str(data_path), max_words=MAX_WORDS, max_len=MAX_LEN)
+    ds.set_direction(direction)
+    return ds
+
+def build_p2g_model(dataset) -> torch.nn.Module:
+    """Instantiates a P2G Transformer for inference."""
+    return P2GTransformer(
+        phone_vocab_size=len(dataset.phone_to_idx),
+        char_vocab_size=len(dataset.char_to_idx),
+        d_model=256, nhead=8, num_layers=4, dim_feedforward=512, max_len=MAX_LEN
+    )
+
+def build_g2p_model(dataset) -> torch.nn.Module:
+    """Instantiates a G2P Transformer for inference."""
+    return G2PTransformer(
+        char_vocab_size=len(dataset.char_to_idx),
+        phone_vocab_size=len(dataset.phone_to_idx),
+        d_model=256, nhead=8, num_layers=4, dim_feedforward=512, max_len=MAX_LEN
+    )
+
+# ---------------------------------------------------------------------------
+# Dynamic Language and Model Loading
+# ---------------------------------------------------------------------------
+
+def find_available_languages(model_dir: Path) -> List[str]:
+    """Scans the model directory to find fully trained languages."""
+    if not model_dir.exists(): return []
+    
+    g2p_pattern = re.compile(r"(.+)_g2p_best_model\.pth")
+    p2g_pattern = re.compile(r"(.+)_p2g_best_model\.pth")
+    g2p_langs = {g2p_pattern.match(f).group(1) for f in os.listdir(model_dir) if g2p_pattern.match(f)}
+    p2g_langs = {p2g_pattern.match(f).group(1) for f in os.listdir(model_dir) if p2g_pattern.match(f)}
+    
+    return sorted(list(g2p_langs.intersection(p2g_langs)))
+
+class LazyLanguage:
+    """Lazy-loads datasets and models for a language the first time it's used."""
+
+    def __init__(self, name: str, device: torch.device):
+        self.name, self.device, self.loaded = name, device, False
+        self.g2p_dataset, self.p2g_dataset = None, None
+        self.g2p_model, self.p2g_model = None, None
+
+    def _load_weights(self, model, tag: str):
+        path = MODEL_DIR / f"{self.name}_{tag}_best_model.pth"
+        try:
+            model.load_state_dict(torch.load(path, map_location=self.device))
+            model.eval()
+            print(f"Loaded {self.name.upper()} {tag.upper()} weights from {path}")
+        except FileNotFoundError:
+            print(f"[WARN] Weights not found for {self.name}.{tag} at {path}")
+
+    def _ensure_loaded(self):
+        if self.loaded: return
+        print(f"\n[INFO] Loading language '{self.name.upper()}' for the first time...")
+        
+        self.g2p_dataset = prepare_dataset(language=self.name, direction="g2p")
+        self.p2g_dataset = prepare_dataset(language=self.name, direction="p2g")
+
+        self.g2p_model = build_g2p_model(self.g2p_dataset).to(self.device)
+        self.p2g_model = build_p2g_model(self.p2g_dataset).to(self.device)
+
+        self._load_weights(self.g2p_model, "g2p")
+        self._load_weights(self.p2g_model, "p2g")
+        self.loaded = True
+
+    def g2p(self, sentence: str) -> str:
+        self._ensure_loaded()
+        ipa_words = [" ".join(inference(self.g2p_model, self.g2p_dataset, word, self.device)) for word in sentence.strip().split()]
+        return " | ".join(ipa_words)
+
+    def p2g(self, ipa_sentence: str) -> str:
+        self._ensure_loaded()
+        groups = [g.strip() for g in ipa_sentence.split('|')]
+        words = [inference(self.p2g_model, self.p2g_dataset, grp.split(), self.device) for grp in groups]
+        return " ".join(words)
+
+    def round_trip(self, sentence: str):
+        self._ensure_loaded()
+        ipa = self.g2p(sentence)
+        recon = self.p2g(ipa)
+        print(f"Original : {sentence}")
+        print(f"IPA      : {ipa}")
+        print(f"Rebuilt  : {recon}")
+        print(f"Match    : {'✓' if sentence.lower() == recon.lower() else '✗'}")
+
+class Tester:
+    def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
+        print(f"[INFO] Using device: {self.device}")
+        self.lang_cache: Dict[str, LazyLanguage] = {}
+        self.available_languages = find_available_languages(MODEL_DIR)
         
-        # Initialize IPA converter
-        self.ipa_converter = ARPAbetIPAConverter()
-        
-        # Load datasets
-        print("Loading datasets...")
-        self.g2p_dataset = Dataset(data_path, freq_path, max_words=200000)
-        self.p2g_dataset = Dataset(data_path, freq_path, max_words=200000)
-        self.g2p_dataset.set_direction('g2p')
-        
-        # Initialize models
-        self.g2p_model = G2PTransformer(
-            char_vocab_size=len(self.g2p_dataset.char_to_idx),
-            phone_vocab_size=len(self.g2p_dataset.phone_to_idx),
-            d_model=128,
-            nhead=16,
-            num_layers=4,
-            dim_feedforward=256,
-            max_len=32
-        ).to(self.device)
-                
-        self.p2g_model = P2GTransformer(
-            phone_vocab_size=len(self.p2g_dataset.phone_to_idx),
-            char_vocab_size=len(self.p2g_dataset.char_to_idx),
-            d_model=128,
-            nhead=16,
-            num_layers=4,
-            dim_feedforward=256,
-            max_len=32
-        ).to(self.device)
-        
-        # Load trained models
-        self.load_models()
-    
-    def load_models(self):
-        """Load trained model weights"""
-        try:
-            self.g2p_model.load_state_dict(torch.load('best_g2p_model.pth', map_location=self.device))
-            print("Loaded G2P model successfully")
-        except FileNotFoundError:
-            print("Warning: G2P model not found. Please train the G2P model first.")
-        
-        try:
-            self.p2g_model.load_state_dict(torch.load('best_p2g_model.pth', map_location=self.device))
-            print("Loaded P2G model successfully")
-        except FileNotFoundError:
-            print("Warning: P2G model not found. Please train the P2G model first.")
-    
-    def test_g2p(self, word: str):
-        """Test grapheme-to-phoneme conversion"""
-        try:
-            phones = inference(self.g2p_model, self.g2p_dataset, word, self.device)
-            return phones
-        except Exception as e:
-            return f"Error: {e}"
-    
-    def test_p2g(self, phones_input):
-        """Test phoneme-to-grapheme conversion"""
-        try:
-            if isinstance(phones_input, str):
-                # Parse phone string (space-separated)
-                phones = phones_input.strip().split()
-            else:
-                phones = phones_input
-            
-            word = inference(self.p2g_model, self.p2g_dataset, phones, self.device)
-            return word
-        except Exception as e:
-            return f"Error: {e}"
-    
-    def test_ipa_to_word(self, ipa_str: str):
-        """Test IPA to word conversion via ARPAbet"""
-        try:
-            # Convert IPA to ARPAbet
-            arpabet_phones = self.ipa_converter.ipa_to_arpabet_convert(ipa_str)
-            
-            # Convert ARPAbet to word using P2G model
-            word = self.test_p2g(arpabet_phones)
-            return word, arpabet_phones
-        except Exception as e:
-            return f"Error: {e}", None
-    
-    def format_phonemes_with_ipa(self, phones):
-        """Format phonemes showing both ARPAbet and IPA"""
-        if not isinstance(phones, list):
-            return str(phones)
-        
-        try:
-            ipa = self.ipa_converter.arpabet_to_ipa_convert(phones)
-            return f"{' '.join(phones)} [{ipa}]"
-        except:
-            return ' '.join(phones)
-    
-    def test_round_trip(self, word: str):
-        """Test round-trip conversion: word -> phones -> word"""
-        try:
-            # G2P: word -> phones
-            phones = self.test_g2p(word)
-            if isinstance(phones, str) and phones.startswith("Error"):
-                return f"G2P failed: {phones}"
-            
-            # Convert to IPA for display
-            ipa = self.ipa_converter.arpabet_to_ipa_convert(phones)
-            
-            # P2G: phones -> word
-            reconstructed = self.test_p2g(phones)
-            if isinstance(reconstructed, str) and reconstructed.startswith("Error"):
-                return f"P2G failed: {reconstructed}"
-            
-            return {
-                'original': word,
-                'phones': phones,
-                'ipa': ipa,
-                'phones_formatted': self.format_phonemes_with_ipa(phones),
-                'reconstructed': reconstructed,
-                'match': word.lower() == reconstructed.lower()
-            }
-        except Exception as e:
-            return f"Error: {e}"
-    
-    def interactive_mode(self):
-        """Interactive testing mode"""
-        print("\n" + "="*60)
-        print("INTERACTIVE MODEL TESTER WITH IPA SUPPORT")
-        print("="*60)
-        print("Commands:")
-        print("  g2p <word>           - Convert word to phonemes (ARPAbet + IPA)")
-        print("  p2g <phones>         - Convert phonemes to word (space-separated)")
-        print("  ipa <IPA>            - Convert IPA to word via ARPAbet")
-        print("  round <word>         - Test round-trip conversion")
-        print("  batch <words>        - Test multiple words (comma-separated)")
-        print("  examples             - Show example commands")
-        print("  quit                 - Exit")
-        print("="*60)
-        
+        if not self.available_languages:
+            print(f"[WARN] No models found in '{MODEL_DIR}/'. Please train models using train.py.")
+        else:
+            print(f"[INFO] Available languages: {', '.join(self.available_languages)}")
+
+    def _get_lang(self, name: str) -> LazyLanguage:
+        if name not in self.lang_cache:
+            self.lang_cache[name] = LazyLanguage(name, self.device)
+        return self.lang_cache[name]
+
+    def _parse_lang(self, args: List[str]):
+        if args and args[0].lower() in self.available_languages:
+            return args[0].lower(), " ".join(args[1:])
+        if len(self.available_languages) == 1:
+            return self.available_languages[0], " ".join(args)
+        return None, " ".join(args)
+
+    def repl(self):
+        print("\n--- Interactive Pronunciation Tool ---")
+        print("Commands: g2p, p2g, round, help, quit")
+        if len(self.available_languages) > 1:
+            print(f"Specify a language, e.g., 'g2p {self.available_languages[0]} hello world'")
+
         while True:
             try:
-                user_input = input("\n> ").strip()
+                raw_input = input(">>> ").strip()
+                if not raw_input: continue
                 
-                if not user_input:
-                    continue
-                
-                if user_input.lower() in ['quit', 'exit', 'q']:
-                    print("Goodbye!")
-                    break
-                
-                if user_input.lower() == 'examples':
-                    self.show_examples()
-                    continue
-                
-                parts = user_input.split(' ', 1)
-                if len(parts) < 2:
-                    print("Invalid command. Type 'examples' for help.")
-                    continue
-                
-                command, args = parts
-                command = command.lower()
-                
-                if command == 'g2p':
-                    word = args.strip()
-                    phones = self.test_g2p(word)
-                    if isinstance(phones, list):
-                        formatted = self.format_phonemes_with_ipa(phones)
-                        print(f"'{word}' -> {formatted}")
-                    else:
-                        print(phones)
-                
-                elif command == 'p2g':
-                    phones_str = args.strip()
-                    word = self.test_p2g(phones_str)
-                    print(f"'{phones_str}' -> {word}")
-                
-                elif command == 'ipa':
-                    ipa_str = args.strip()
-                    word, arpabet_phones = self.test_ipa_to_word(ipa_str)
-                    if arpabet_phones:
-                        print(f"'{ipa_str}' -> {' '.join(arpabet_phones)} -> {word}")
-                    else:
-                        print(f"'{ipa_str}' -> {word}")
-                
-                elif command == 'round':
-                    word = args.strip()
-                    result = self.test_round_trip(word)
-                    if isinstance(result, dict):
-                        print(f"Original:      {result['original']}")
-                        print(f"Phonemes:      {result['phones_formatted']}")
-                        print(f"Reconstructed: {result['reconstructed']}")
-                        print(f"Match:         {'✓' if result['match'] else '✗'}")
-                    else:
-                        print(result)
-                
-                elif command == 'batch':
-                    words = [w.strip() for w in args.split(',')]
-                    print(f"\nTesting {len(words)} words:")
-                    print("-" * 80)
-                    matches = 0
-                    for word in words:
-                        if word:
-                            result = self.test_round_trip(word)
-                            if isinstance(result, dict):
-                                status = "✓" if result['match'] else "✗"
-                                phones_display = result['phones_formatted']
-                                if len(phones_display) > 35:
-                                    phones_display = phones_display[:32] + "..."
-                                print(f"{word:12} -> {phones_display:35} -> {result['reconstructed']:12} {status}")
-                                if result['match']:
-                                    matches += 1
-                            else:
-                                print(f"{word:12} -> ERROR")
-                    print(f"\nAccuracy: {matches}/{len(words)} ({100*matches/len(words):.1f}%)")
-                
-                else:
-                    print("Unknown command. Type 'examples' for help.")
-            
-            except KeyboardInterrupt:
-                print("\nGoodbye!")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
-    
-    def show_examples(self):
-        """Show example commands"""
-        print("\nExample commands:")
-        print("  g2p hello")
-        print("  g2p pronunciation")
-        print("  p2g HH EH 1 L OW 0")
-        print("  p2g P R AH 0 N AH 0 N S IY 1 EY 2 SH AH 0 N")
-        print("  ipa həˈloʊ")
-        print("  ipa prənʌnsiˈeɪʃən")
-        print("  round hello")
-        print("  round transformer")
-        print("  batch hello,world,cat,dog,pronunciation")
+                cmd, *args = raw_input.split()
+                cmd = cmd.lower()
 
-def main():
-    """Main function with command line interface"""
-    if len(sys.argv) > 1:
-        # Command line mode
-        command = sys.argv[1].lower()
-        
-        tester = ModelTester()
-        
-        if command == 'g2p' and len(sys.argv) >= 3:
-            word = ' '.join(sys.argv[2:])
-            phones = tester.test_g2p(word)
-            if isinstance(phones, list):
-                formatted = tester.format_phonemes_with_ipa(phones)
-                print(formatted)
-            else:
-                print(phones)
-        
-        elif command == 'p2g' and len(sys.argv) >= 3:
-            phones_str = ' '.join(sys.argv[2:])
-            word = tester.test_p2g(phones_str)
-            print(word)
-        
-        elif command == 'ipa' and len(sys.argv) >= 3:
-            ipa_str = ' '.join(sys.argv[2:])
-            word, arpabet_phones = tester.test_ipa_to_word(ipa_str)
-            if arpabet_phones:
-                print(f"ARPAbet: {' '.join(arpabet_phones)}")
-                print(f"Word: {word}")
-            else:
-                print(word)
-        
-        elif command == 'round' and len(sys.argv) >= 3:
-            word = ' '.join(sys.argv[2:])
-            result = tester.test_round_trip(word)
-            if isinstance(result, dict):
-                print(f"Original: {result['original']}")
-                print(f"Phonemes: {result['phones_formatted']}")
-                print(f"Reconstructed: {result['reconstructed']}")
-                print(f"Match: {'Yes' if result['match'] else 'No'}")
-            else:
-                print(result)
-        
+                if cmd in ("quit", "exit"): break
+                if cmd == "help":
+                    print("\nUsage: <command> [<language>] <text>")
+                    print("  g2p en_us hello world")
+                    print("  p2g fr_fr b ɔ̃ ʒ u ʁ")
+                    print("  round de hallo welt")
+                    print("\nIf only one language is available, specifying it is optional.")
+                    continue
+
+                lang, payload = self._parse_lang(args)
+
+                if not lang:
+                    print(f"[ERROR] Language missing or invalid. Choose from: {', '.join(self.available_languages)}")
+                    continue
+                if not payload:
+                    print(f"[ERROR] No text provided for processing.")
+                    continue
+                
+                handler = getattr(self, f"cmd_{cmd}", None)
+                if handler:
+                    handler(lang, payload)
+                else:
+                    print(f"Unknown command: '{cmd}'. Type 'help'.")
+
+            except (EOFError, KeyboardInterrupt): break
+            except Exception as e: print(f"[ERROR] {e}")
+        print("\nExiting.")
+
+    def cmd_g2p(self, lang: str, text: str):
+        ipa = self._get_lang(lang).g2p(text)
+        print(f"[{lang.upper()}] {text} → {ipa}")
+
+    def cmd_p2g(self, lang: str, ipa: str):
+        text = self._get_lang(lang).p2g(ipa)
+        print(f"[{lang.upper()}] {ipa} → {text}")
+
+    def cmd_round(self, lang: str, text: str):
+        self._get_lang(lang).round_trip(text)
+
+    def cli(self):
+        if len(sys.argv) < 2:
+            self.repl()
+            return
+            
+        cmd = sys.argv[1].lower()
+        lang, payload = self._parse_lang(sys.argv[2:])
+
+        if not lang:
+            print(f"Language missing or invalid. Choose from: {', '.join(self.available_languages)}")
+            return
+        if not payload:
+            print("No text provided.")
+            return
+
+        handler = getattr(self, f"cmd_{cmd}", None)
+        if handler:
+            handler(lang, payload)
         else:
-            print("Usage:")
-            print("  python test_models.py g2p <word>")
-            print("  python test_models.py p2g <phonemes>")
-            print("  python test_models.py ipa <IPA_transcription>")
-            print("  python test_models.py round <word>")
-            print("  python test_models.py  (for interactive mode)")
-    
-    else:
-        # Interactive mode
-        tester = ModelTester()
-        tester.interactive_mode()
+            print(f"Unknown command: {cmd}. Use g2p, p2g, or round.")
 
 if __name__ == "__main__":
-    main()
+    Tester().cli()
