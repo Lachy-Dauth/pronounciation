@@ -4,10 +4,9 @@ Interactive testing script for both G2P and P2G models with IPA support
 import torch
 import sys
 import re
-from g2p_transformer import G2PTransformer, inference as g2p_inference
-from p2g_transformer import P2GTransformer, inference as p2g_inference
+from transformer import G2PTransformer, P2GTransformer, train_model, inference
 from PhoneDataset import PhoneDataset as Dataset
-from arpabet_ipa_converter import ARPAbetIPAConverter
+from arpabetIpaConverter import ARPAbetIPAConverter
 
 class ModelTester:
     def __init__(self, data_path='cmudict.dict', freq_path='word_frequencies.csv'):
@@ -64,7 +63,7 @@ class ModelTester:
     def test_g2p(self, word: str):
         """Test grapheme-to-phoneme conversion"""
         try:
-            phones = g2p_inference(self.g2p_model, self.g2p_dataset, word, self.device)
+            phones = inference(self.g2p_model, self.g2p_dataset, word, self.device)
             return phones
         except Exception as e:
             return f"Error: {e}"
@@ -78,7 +77,7 @@ class ModelTester:
             else:
                 phones = phones_input
             
-            word = p2g_inference(self.p2g_model, self.p2g_dataset, phones, self.device)
+            word = inference(self.p2g_model, self.p2g_dataset, phones, self.device)
             return word
         except Exception as e:
             return f"Error: {e}"

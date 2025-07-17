@@ -1,0 +1,5 @@
+*.pth
+*.dict
+*.csv
+.git/*
+__pycache__/*

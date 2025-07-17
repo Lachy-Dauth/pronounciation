@@ -4,8 +4,12 @@ from typing import List, Tuple, Optional
 import torch
 from torch.utils.data import Dataset
 import math
+from arpabetIpaConverter import ARPAbetIPAConverter
 
 class PhoneDataset(Dataset):
+
+    ipa_converter = ARPAbetIPAConverter()
+
     def __init__(self, data_path: str, freq_path: Optional[str] = None, max_words: int = 20000, 
                  max_len: int = 32):
         self.max_len = max_len
@@ -14,7 +18,7 @@ class PhoneDataset(Dataset):
         self.phone_to_idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
         self.idx_to_char = {0: '<pad>', 1: '<sos>', 2: '<eos>', 3: '<unk>'}
         self.idx_to_phone = {0: '<pad>', 1: '<sos>', 2: '<eos>', 3: '<unk>'}
-        self.direction = 'g2p'  # Default direction is G2P
+        self.direction = 'g2p'
         self.word_weights = {}
         
         # Load frequency data if provided
@@ -77,12 +81,17 @@ class PhoneDataset(Dataset):
         for word, _, freq in freq_filtered[:max_words]:
             self.word_weights[word] = self._calculate_weight(freq)
         
+        # # Print every 5000 with there chance of being sampled
+        # for i, (word, _, freq) in enumerate(freq_filtered[:max_words]):
+        #     if i % 5000 == 0:
+        #         print(f"Word: {word}, Frequency: {freq}, Weight: {self.word_weights[word]}")
+
         # Return just word-phone pairs
         return [(w, p) for w, p, _ in freq_filtered[:max_words]]
     
     def _calculate_weight(self, freq: int) -> float:
         """Calculate sampling weight from frequency"""
-        return max(1.0, math.sqrt(freq))  # Square root to reduce extreme weights
+        return max(1.0, math.sqrt(freq) ** 0.6 * math.atan((freq + 1) / 1000000))
     
     def _parse_cmu_dict(self, data_path: str) -> List[Tuple[str, List[str]]]:
         """Parse CMU pronunciation dictionary"""
@@ -101,10 +110,12 @@ class PhoneDataset(Dataset):
                 
                 word, phones_str = parts
                 
-                # Skip alternative pronunciations (contains parentheses)
                 if '(' in word:
                     continue
-                
+                    word = word[:word.index('(')].strip()
+                    if len(word) == 0:
+                        continue
+                    
                 # Skip words that don't start with A-Z
                 if not word[0].isalpha():
                     continue
@@ -113,10 +124,14 @@ class PhoneDataset(Dataset):
                 phones = []
                 for phone in phones_str.split():
                     if phone[-1].isdigit():
-                        phones.append(phone[:-1])  # Phone without stress
-                        phones.append(phone[-1])  # Stress marker
+                        phones.append(phone[:-1]) # Phone without stress
                     else:
                         phones.append(phone)
+
+                phones = [self.ipa_converter.convert_character_from_arpabet(phone) for phone in phones]
+
+                if word == 'HELLO':
+                    print(f"Converted 'hello' phones: {phones}")
                     
                 data.append((word.upper(), phones))
         
@@ -256,6 +271,11 @@ class PhoneDataset(Dataset):
             raise ValueError("Direction must be 'g2p' or 'p2g'")
         self.direction = direction
 
+    def __str__(self):
+        return f"PhoneDataset(direction={self.direction}, size={len(self.data)}, " \
+               f"char_vocab_size={len(self.char_to_idx)}, phone_vocab_size={len(self.phone_to_idx)})" \
+               f"\nWord weights: {len(self.word_weights)} unique words" \
+               f"\nSample data: {self.data[:3]}"
 
 class WeightedSampler:
     """Custom sampler that weights samples by word frequency"""
